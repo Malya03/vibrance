@@ -70,10 +70,14 @@ that path switched off (KDE bug 525839).
 ## Install
 
 ```bash
-install -Dm755 vibrance ~/.local/bin/vibrance
+git clone https://github.com/Malya03/vibrance.git
+install -Dm755 vibrance/vibrance ~/.local/bin/vibrance
 ```
 
-Any directory in your `PATH` will do.
+Any directory in your `PATH` will do. The script is a single file, so you can
+also download just [`vibrance`](vibrance) and make it executable.
+
+To update, run `git pull` in the clone and repeat the `install` command.
 
 ## Usage
 
