@@ -1,0 +1,630 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# vibrance - display-level saturation ("digital vibrance") for KDE Plasma on Wayland
+# Copyright (C) 2026 vibrance contributors
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option) any
+# later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+# details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+"""vibrance - display-level saturation ("digital vibrance") for KDE Plasma on Wayland.
+
+KWin has no saturation control, but it color-manages every window against the
+display's ICC profile. This tool writes a synthetic display profile whose
+primaries are pulled towards the white point. KWin then believes the display
+is less saturated than it really is and compensates with a saturation matrix
+while compositing. Nothing is injected into games: no Vulkan layer, no shader
+hook, and it works with any GPU vendor.
+
+  vibrance on [PERCENT] [-o DISPLAY[=PERCENT]]...      enable
+  vibrance off [-o DISPLAY]...                         restore the previous color settings
+  vibrance toggle [PERCENT] [-o DISPLAY[=PERCENT]]...  switch between the two
+  vibrance run [PERCENT] [-o ...] -- COMMAND           enable only while COMMAND is running
+  vibrance status                                      list the displays and their state
+  vibrance make PERCENT [FILE]                         only write the ICC profile
+
+PERCENT is the saturation: 100 is neutral, 150 is a good start, 272 is the most
+KWin accepts. Without PERCENT every display gets the level it had last time.
+Without -o every enabled display is used; -o can be given more than once.
+
+  vibrance on 160                         all displays
+  vibrance on -o eDP-1=160 -o DP-2=125    a level of its own for each display
+  vibrance off -o DP-2                    one display back to normal
+  vibrance run -- %command%               Steam launch options
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import signal
+import struct
+import subprocess
+import sys
+from pathlib import Path
+
+__version__ = "1.0.0"
+
+DEFAULT_PERCENT = 150
+MIN_PERCENT = 100
+# KWin refuses display profiles whose xy gamut triangle is smaller than 0.02
+# (Colorimetry::isValid). 272 percent is the last level that stays above it.
+MAX_PERCENT = 272
+
+# KWin only reads a profile again when its path changes, so the file name has
+# to change whenever build_profile() produces different bytes: bump this.
+PROFILE_REVISION = 1
+PROFILE_NAME = re.compile(r"vibrance-(\d+)-r\d+\.icc")
+
+GAMMA = 2.2
+# The same constants KWin uses for sRGB content (Colorimetry::BT709) ...
+PRIMARIES = ((0.64, 0.33), (0.30, 0.60), (0.15, 0.06))
+WHITE_D65 = (0.3127, 0.3290)
+# ... and for the ICC profile connection space.
+PCS_D50 = (0.9642, 1.0, 0.8249)
+
+SOURCES = ("sRGB", "ICC", "EDID")
+TRADEOFFS = ("preferEfficiency", "preferAccuracy")
+
+
+class VibranceError(Exception):
+    pass
+
+
+def warn(message):
+    print("vibrance: warning: %s" % message, file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
+# color math (3x3 matrices as nested lists, no third-party dependencies)
+
+def mat_mul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def mat_vec(a, v):
+    return [sum(a[i][k] * v[k] for k in range(3)) for i in range(3)]
+
+
+def mat_inv(m):
+    (a, b, c), (d, e, f), (g, h, i) = m
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    return [[(e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det],
+            [(f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det],
+            [(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det]]
+
+
+def xy_to_xyz(x, y):
+    return [x / y, 1.0, (1.0 - x - y) / y]
+
+
+def rgb_to_xyz_matrix(primaries, white):
+    cols = [xy_to_xyz(*p) for p in primaries]
+    m = [[cols[j][i] for j in range(3)] for i in range(3)]
+    scale = mat_vec(mat_inv(m), xy_to_xyz(*white))
+    return [[m[i][j] * scale[j] for j in range(3)] for i in range(3)]
+
+
+def bradford(src_white, dst_white):
+    cone = [[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.0367], [0.0389, -0.0685, 1.0296]]
+    s, d = mat_vec(cone, src_white), mat_vec(cone, dst_white)
+    scale = [[d[i] / s[i] if i == j else 0.0 for j in range(3)] for i in range(3)]
+    return mat_mul(mat_inv(cone), mat_mul(scale, cone))
+
+
+def narrowed_gamut(percent):
+    """RGB->XYZ matrix and xy primaries of the fake display for a saturation.
+
+    The wanted effect is the luminance-preserving saturation matrix
+        S(s) = (1 - s) * ones * luma^T + s * I        (applied in linear light)
+    KWin converts sRGB content with inverse(display) * sRGB, so the display
+    has to be sRGB * inverse(S(s)), and inverse(S(s)) is simply S(1 / s).
+    """
+    k = 100.0 / percent
+    srgb = rgb_to_xyz_matrix(PRIMARIES, WHITE_D65)
+    luma = srgb[1]
+    desaturate = [[(1.0 - k) * luma[j] + (k if i == j else 0.0) for j in range(3)] for i in range(3)]
+    display = mat_mul(srgb, desaturate)
+    xy = []
+    for j in range(3):
+        total = display[0][j] + display[1][j] + display[2][j]
+        xy.append((display[0][j] / total, display[1][j] / total))
+    return display, xy
+
+
+def check_percent(percent):
+    if not MIN_PERCENT <= percent <= MAX_PERCENT:
+        raise VibranceError("saturation must be between %d and %d percent, not %d "
+                            "(KWin rejects narrower fake gamuts)" % (MIN_PERCENT, MAX_PERCENT, percent))
+    return percent
+
+
+# --------------------------------------------------------------------------
+# ICC v4 display profile writer
+
+def s15f16(value):
+    return struct.pack(">i", round(value * 65536))
+
+
+def u16f16(value):
+    return struct.pack(">I", round(value * 65536))
+
+
+def xyz_type(xyz):
+    return b"XYZ " + bytes(4) + b"".join(s15f16(v) for v in xyz)
+
+
+def mluc_type(text):
+    data = text.encode("utf-16-be")
+    return b"mluc" + bytes(4) + struct.pack(">II", 1, 12) + b"enUS" + struct.pack(">II", len(data), 28) + data
+
+
+def tone_curve():
+    """Gamma 2.2 as a sampled curve, so that KWin's gamma 2.2 decode cancels out.
+
+    KWin inverts the curve numerically in 16-bit steps. A plain gamma curve
+    rounds to zero in its first entries, which makes the inverse of zero
+    ambiguous: KWin 6.7 and newer then lift black by one 8-bit code. Keeping
+    every entry after the first clearly above zero pins black to exactly zero.
+    """
+    size, floor = 4096, 10
+    table = [0] + [max(floor, round(65535 * (i / (size - 1)) ** GAMMA)) for i in range(1, size)]
+    return b"curv" + bytes(4) + struct.pack(">I%dH" % size, size, *table)
+
+
+def build_profile(percent):
+    display, xy = narrowed_gamut(percent)
+    chad = bradford(xy_to_xyz(*WHITE_D65), PCS_D50)
+    colorants = mat_mul(chad, display)
+    trc = tone_curve()
+    tags = [
+        (b"desc", mluc_type("Vibrance %d%% (sRGB, gamma 2.2)" % percent)),
+        (b"cprt", mluc_type("Public domain")),
+        (b"wtpt", xyz_type(PCS_D50)),
+        (b"chad", b"sf32" + bytes(4) + b"".join(s15f16(v) for row in chad for v in row)),
+        (b"rXYZ", xyz_type([colorants[i][0] for i in range(3)])),
+        (b"gXYZ", xyz_type([colorants[i][1] for i in range(3)])),
+        (b"bXYZ", xyz_type([colorants[i][2] for i in range(3)])),
+        (b"rTRC", trc),
+        (b"gTRC", trc),
+        (b"bTRC", trc),
+        (b"chrm", b"chrm" + bytes(4) + struct.pack(">HH", 3, 0) + b"".join(u16f16(x) + u16f16(y) for x, y in xy)),
+    ]
+
+    table, body, offsets = [], b"", {}
+    base = 128 + 4 + 12 * len(tags)
+    for signature, data in tags:
+        if data not in offsets:  # identical tag data is stored once (the three TRCs)
+            offsets[data] = base + len(body)
+            body += data + bytes(-len(data) % 4)
+        table.append(signature + struct.pack(">II", offsets[data], len(data)))
+
+    header = (struct.pack(">I4sI4s4s4s", base + len(body), bytes(4), 0x04300000, b"mntr", b"RGB ", b"XYZ ")
+              + struct.pack(">6H", 2026, 1, 1, 0, 0, 0)  # fixed date keeps the output reproducible
+              + b"acsp"
+              + bytes(4)        # primary platform
+              + bytes(4)        # flags
+              + bytes(8)        # device manufacturer, model
+              + bytes(8)        # device attributes
+              + bytes(4)        # rendering intent: perceptual
+              + b"".join(s15f16(v) for v in PCS_D50)
+              + bytes(4)        # creator
+              + bytes(16)       # profile ID, filled in below
+              + bytes(28))
+    assert len(header) == 128
+    blob = header + struct.pack(">I", len(tags)) + b"".join(table) + body
+    # The ID is the MD5 of the profile with flags, intent and ID zeroed: true right now.
+    return blob[:84] + hashlib.md5(blob).digest() + blob[100:]
+
+
+def xdg_dir(variable, fallback):
+    value = os.environ.get(variable, "")
+    return Path(value) if os.path.isabs(value) else Path.home() / fallback
+
+
+def profile_dir():
+    return xdg_dir("XDG_DATA_HOME", ".local/share") / "vibrance"
+
+
+def profile_path(percent):
+    return profile_dir() / ("vibrance-%d-r%d.icc" % (percent, PROFILE_REVISION))
+
+
+def write_atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
+
+
+def write_profile(percent, path):
+    data = build_profile(check_percent(percent))
+    path = Path(path)
+    if not path.is_file() or path.read_bytes() != data:
+        write_atomic(path, data)
+    return path
+
+
+def percent_of(path):
+    """Saturation encoded in one of our profile paths, or None for foreign files."""
+    path = Path(path)
+    match = PROFILE_NAME.fullmatch(path.name)
+    return int(match.group(1)) if match and path.parent == profile_dir() else None
+
+
+# --------------------------------------------------------------------------
+# talking to KWin through kscreen-doctor
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def host_env():
+    """Environment for kscreen-doctor, also when started from inside Steam."""
+    env = dict(os.environ)
+    env.pop("LD_PRELOAD", None)
+    if "SYSTEM_LD_LIBRARY_PATH" in env:  # exported by steam.sh: the value before Steam changed it
+        if env["SYSTEM_LD_LIBRARY_PATH"]:
+            env["LD_LIBRARY_PATH"] = env["SYSTEM_LD_LIBRARY_PATH"]
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    if env.get("WAYLAND_DISPLAY"):  # some game setups force Qt programs onto XWayland
+        env["QT_QPA_PLATFORM"] = "wayland"
+    return env
+
+
+def doctor(*args):
+    try:
+        proc = subprocess.run(["kscreen-doctor", *args], env=host_env(), capture_output=True,
+                              encoding="utf-8", errors="replace", timeout=30)
+    except FileNotFoundError:
+        raise VibranceError("kscreen-doctor not found (it is part of KDE Plasma's libkscreen)")
+    except subprocess.TimeoutExpired:
+        raise VibranceError("kscreen-doctor did not answer within 30 seconds")
+    # A configuration KWin rejects is only reported on stdout; the exit code stays 0.
+    rejected = re.search(r"applying config failed!\s*(.*)", proc.stdout)
+    if rejected:
+        raise VibranceError("KWin rejected the configuration: %s" % (rejected.group(1) or "no reason given"))
+    if proc.returncode != 0:
+        detail = ANSI.sub("", (proc.stderr or proc.stdout).strip())
+        raise VibranceError("kscreen-doctor %s failed: %s" % (" ".join(args), detail or "exit %d" % proc.returncode))
+    return proc.stdout
+
+
+def read_displays():
+    """Displays and their color settings, parsed from 'kscreen-doctor -o'.
+
+    The JSON output (-j) would be nicer to read, but it leaves out the color
+    profile source and the color power preference.
+    """
+    displays, current = [], None
+    for line in ANSI.sub("", doctor("-o")).splitlines():
+        text = line.strip()
+        if line.startswith("Output:"):
+            fields = text.split()  # Output: <id> <name> [<uuid>, Plasma 6.4 and newer]
+            current = None
+            if len(fields) >= 3:
+                current = {"name": fields[2], "key": fields[3] if len(fields) > 3 else fields[2],
+                           "enabled": True, "hdr": False, "icc": None, "source": None, "tradeoff": None}
+                displays.append(current)
+        elif current is None:
+            continue
+        elif text in ("disabled", "disconnected"):
+            current["enabled"] = False
+        else:
+            key, _, value = text.partition(": ")
+            if key in ("HDR", "Wide Color Gamut"):
+                current["hdr"] = current["hdr"] or value == "enabled"
+            elif key == "ICC profile" and value != "incapable":
+                current["icc"] = "" if value == "none" else value
+            elif key == "Color profile source" and value in SOURCES:
+                current["source"] = value
+            elif key == "Color power preference":  # Plasma 6.3 and newer
+                current["tradeoff"] = "preferAccuracy" if "accuracy" in value else "preferEfficiency"
+    return displays
+
+
+def active_percent(display):
+    return percent_of(display["icc"]) if display["source"] == "ICC" and display["icc"] else None
+
+
+def problem(display):
+    """Why vibrance cannot be used on a display right now, or None."""
+    if not display["enabled"]:
+        return "the display is disabled"
+    if display["icc"] is None:  # KWin only offers ICC profiles for real displays
+        return "it has no color profile setting (a virtual display, or not a Plasma Wayland session)"
+    if display["source"] is None:
+        return "this Plasma version is too old, 6.1 or newer is needed"
+    if display["hdr"]:
+        return "HDR or wide color gamut is enabled, and KWin ignores the ICC profile in that mode"
+    return None
+
+
+def pick_targets(displays, wanted, percent=None):
+    """Resolve the -o options to [(display, percent or None, named explicitly)]."""
+    by_name = {display["name"]: display for display in displays}
+    targets = {}
+    for name, own_percent in wanted or [("all", None)]:
+        level = percent if own_percent is None else own_percent
+        if name == "all":
+            for display in displays:
+                if display["enabled"]:
+                    targets.setdefault(display["name"], (display, level, False))
+        elif name in by_name:
+            targets[name] = (by_name[name], level, True)
+        else:
+            raise VibranceError("there is no display named %s (available: %s)"
+                                % (name, ", ".join(sorted(by_name)) or "none"))
+    if not targets:
+        raise VibranceError("no enabled display found")
+    return list(targets.values())
+
+
+# --------------------------------------------------------------------------
+# remembered per-display state: the last level and what to go back to
+
+def state_path():
+    return xdg_dir("XDG_STATE_HOME", ".local/state") / "vibrance" / "displays.json"
+
+
+def load_state():
+    try:
+        state = json.loads(state_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(state, dict):
+        return {}
+    return {key: entry for key, entry in state.items() if isinstance(entry, dict)}
+
+
+def save_state(state):
+    write_atomic(state_path(), (json.dumps(state, indent=2, sort_keys=True) + "\n").encode())
+
+
+def level_of(display, state):
+    """The level a display gets when none is given: the last one, else the current one."""
+    for level in (state.get(display["key"], {}).get("percent"), active_percent(display)):
+        if isinstance(level, int) and MIN_PERCENT <= level <= MAX_PERCENT:
+            return level
+    return DEFAULT_PERCENT
+
+
+# --------------------------------------------------------------------------
+# actions
+
+def enable_args(display, path):
+    """kscreen-doctor settings that put a vibrance profile on a display."""
+    name, args = display["name"], []
+    if display["icc"] != path:
+        args.append("output.%s.iccprofile.%s" % (name, path))
+    if display["source"] != "ICC":
+        args.append("output.%s.colorProfileSource.ICC" % name)
+    if display["tradeoff"] == "preferAccuracy":
+        # With "prefer accuracy" KWin applies ICC profiles in a second full-screen pass.
+        args.append("output.%s.colorPowerTradeoff.preferEfficiency" % name)
+    return args
+
+
+def restore_args(display, saved):
+    """kscreen-doctor settings that bring back what a display had before vibrance."""
+    name = display["name"]
+    saved = saved if isinstance(saved, dict) else {}
+    source, icc = saved.get("source"), saved.get("icc")
+    if not isinstance(icc, str) or percent_of(icc) is not None or not os.path.isfile(icc):
+        icc = ""  # KWin rejects a configuration that names a missing profile
+    if source not in SOURCES or (source == "ICC" and not icc):
+        source = "sRGB"  # nothing usable was saved
+    args = ["output.%s.iccprofile.%s" % (name, icc), "output.%s.colorProfileSource.%s" % (name, source)]
+    if display["tradeoff"] and saved.get("tradeoff") in TRADEOFFS and saved["tradeoff"] != display["tradeoff"]:
+        args.append("output.%s.colorPowerTradeoff.%s" % (name, saved["tradeoff"]))
+    return args, source
+
+
+def apply(turn_on, turn_off, state, remember=True, quiet=False):
+    """Change several displays with a single KWin configuration.
+
+    turn_on is a list of (display, percent or None, named explicitly) and
+    turn_off a list of displays. Displays that are already there are left alone.
+    """
+    def say(message):
+        if not quiet:
+            print(message)
+
+    args, levels, enabled, disabled = [], [], [], []
+    for display, percent, explicit in turn_on:
+        reason = problem(display)
+        if reason:
+            if explicit:
+                raise VibranceError("%s: %s" % (display["name"], reason))
+            say("%s: skipped, %s" % (display["name"], reason))
+            continue
+        percent = check_percent(level_of(display, state) if percent is None else percent)
+        levels.append((display, percent))
+        path = str(write_profile(percent, profile_path(percent)))
+        changes = enable_args(display, path)
+        if changes:
+            args += changes
+            enabled.append((display, percent, path))
+        else:
+            say("%s: vibrance is already at %d%%" % (display["name"], percent))
+    for display in turn_off:
+        if active_percent(display) is not None:
+            changes, source = restore_args(display, state.get(display["key"], {}).get("restore"))
+            args += changes
+            disabled.append((display, source))
+
+    if args:
+        doctor(*args)
+        # Plasma before 6.3 does not report a rejected configuration, so look at the result.
+        now = {display["key"]: display for display in read_displays()}
+        for display, percent, path in enabled:
+            current = now.get(display["key"])
+            if not current or current["source"] != "ICC" or current["icc"] != path:
+                raise VibranceError("KWin did not apply %s on %s" % (path, display["name"]))
+        for display, source in disabled:
+            current = now.get(display["key"])
+            if current and active_percent(current) is not None:
+                raise VibranceError("KWin did not restore the color settings of %s" % display["name"])
+
+    before = json.dumps(state, sort_keys=True)
+    for display, percent, path in enabled:
+        if active_percent(display) is None:  # remember what to go back to, but only once
+            state.setdefault(display["key"], {})["restore"] = {
+                "source": display["source"], "icc": display["icc"], "tradeoff": display["tradeoff"]}
+        say("%s: vibrance %d%%" % (display["name"], percent))
+    for display, source in disabled:
+        state.get(display["key"], {}).pop("restore", None)
+        say("%s: vibrance off (color profile source: %s)" % (display["name"], source))
+    if remember:
+        for display, percent in levels:
+            state.setdefault(display["key"], {})["percent"] = percent
+    for display in [d for d, _ in levels] + [d for d, _ in disabled]:
+        if display["key"] in state:
+            state[display["key"]]["name"] = display["name"]  # only for people reading the file
+    if json.dumps(state, sort_keys=True) != before:
+        save_state(state)
+
+
+def switch(action, wanted, percent):
+    displays, state = read_displays(), load_state()
+    targets = pick_targets(displays, wanted, percent)
+    active = [display for display, _, _ in targets if active_percent(display) is not None]
+    if action == "on" or (action == "toggle" and not active):
+        apply(targets, [], state)
+        if all(problem(display) for display, _, _ in targets):
+            raise VibranceError("vibrance cannot be used on any of the displays")
+    elif active:
+        apply([], active, state)
+    else:
+        print("vibrance is not active")
+
+
+def run(wanted, percent, command):
+    """Enable while a command runs. A failure to enable must never block the game."""
+    child, early = None, []
+
+    def forward(signum, _frame):
+        if child is None:
+            early.append(signum)  # arrived during the setup: pass it on once the command exists
+        elif child.poll() is None:
+            child.send_signal(signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, forward)
+
+    before = {}  # display key -> the level that was active (None: vibrance was off)
+    try:
+        displays, state = read_displays(), load_state()
+        targets = pick_targets(displays, wanted, percent)
+        before = {display["key"]: active_percent(display) for display, _, _ in targets}
+        apply(targets, [], state, remember=False, quiet=True)
+    except (VibranceError, OSError) as error:
+        warn("%s; starting the command without it" % error)
+
+    try:
+        child = subprocess.Popen(command)
+        for signum in early:
+            child.send_signal(signum)
+        code = child.wait()
+        return 128 - code if code < 0 else code  # killed by a signal: shell convention
+    except OSError as error:
+        print("vibrance: error: cannot start %s: %s" % (command[0], error.strerror or error), file=sys.stderr)
+        return 127 if isinstance(error, FileNotFoundError) else 126
+    finally:
+        if before:
+            try:
+                now = [display for display in read_displays() if display["key"] in before]
+                apply([(display, before[display["key"]], False) for display in now if before[display["key"]]],
+                      [display for display in now if not before[display["key"]]],
+                      load_state(), remember=False, quiet=True)
+            except (VibranceError, OSError) as error:
+                warn("could not restore the color settings: %s" % error)
+
+
+def status():
+    displays, state = read_displays(), load_state()
+    if not displays:
+        raise VibranceError("kscreen-doctor reported no displays")
+    width = max(len(display["name"]) for display in displays)
+    for display in displays:
+        percent, reason = active_percent(display), problem(display)
+        if percent is not None and not reason:
+            text = "on, %d%%" % percent
+            if display["tradeoff"] == "preferAccuracy":
+                text += " (color accuracy is preferred: KWin applies the profile in an extra pass)"
+        elif reason:
+            text = "unavailable: %s" % reason
+        elif "percent" in state.get(display["key"], {}):
+            text = "off (last level %d%%)" % level_of(display, state)
+        else:
+            text = "off"
+        print("%-*s  %s" % (width, display["name"], text))
+
+
+def output_option(value):
+    name, separator, level = value.partition("=")
+    if not name or (separator and not level.isdigit()):
+        raise argparse.ArgumentTypeError("expected DISPLAY or DISPLAY=PERCENT, got %r" % value)
+    return name, int(level) if separator else None
+
+
+def main(argv):
+    command = []
+    if "--" in argv:
+        split = argv.index("--")
+        argv, command = argv[:split], argv[split + 1:]
+
+    parser = argparse.ArgumentParser(prog="vibrance", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version="vibrance %s" % __version__)
+    sub = parser.add_subparsers(dest="action", required=True, metavar="ACTION")
+    for action, text in (("on", "enable"), ("toggle", "enable if off, otherwise restore"),
+                         ("run", "enable while the command after -- is running"),
+                         ("off", "restore the previous color settings")):
+        p = sub.add_parser(action, help=text)
+        if action != "off":
+            p.add_argument("percent", nargs="?", type=int, metavar="PERCENT",
+                           help="saturation from %d to %d, 100 is neutral (default: the last level of each "
+                                "display, %d at first)" % (MIN_PERCENT, MAX_PERCENT, DEFAULT_PERCENT))
+        p.add_argument("-o", "--output", action="append", type=output_option,
+                       metavar="DISPLAY" if action == "off" else "DISPLAY[=PERCENT]",
+                       help="display name as listed by 'vibrance status', or 'all'; can be repeated "
+                            "(default: every enabled display)")
+    sub.add_parser("status", help="list the displays and their state")
+    p = sub.add_parser("make", help="only write the ICC profile")
+    p.add_argument("percent", type=int, metavar="PERCENT")
+    p.add_argument("file", nargs="?", metavar="FILE", help="destination (default: the profile directory of this tool)")
+    args = parser.parse_args(argv)
+
+    if args.action == "run":
+        if not command:
+            parser.error("run needs a command: vibrance run [PERCENT] -- COMMAND...")
+        return run(args.output, args.percent, command)
+    if command:
+        parser.error("only 'run' takes a command after --")
+
+    try:
+        if args.action == "make":
+            print(write_profile(args.percent, args.file or profile_path(args.percent)))
+        elif args.action == "status":
+            status()
+        else:
+            switch(args.action, args.output, getattr(args, "percent", None))
+    except (VibranceError, OSError) as error:
+        print("vibrance: error: %s" % error, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
